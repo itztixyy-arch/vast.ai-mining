@@ -66,12 +66,19 @@ pkill -f miner-watch-loop; pkill -f run-miner.sh; tmux kill-session -t miner 2>/
 pkill -f SRBMiner-MULTI; pkill -f bzminer
 echo "Miner and watchdog stopped."
 S
-  chmod +x "$DIR/watch.sh" "$DIR/stop.sh"
+  cat > "$DIR/loop.sh" <<'L'
+#!/usr/bin/env bash
+# Starts the 5-minute watchdog loop if it is not already running.
+pgrep -f miner-watch-loop >/dev/null && exit 0
+nohup bash -c 'while true; do sleep 300; bash "$HOME/miner/watchdog.sh"; done' miner-watch-loop >/dev/null 2>&1 &
+L
+  chmod +x "$DIR/watch.sh" "$DIR/stop.sh" "$DIR/loop.sh"
 }
 
 install_autostart() {
   write_helpers
-  grep -q 'miner/watch.sh' "$HOME/.bashrc" 2>/dev/null || echo '[ -n "$PS1" ] && [ -z "$TMUX" ] && bash "$HOME/miner/watch.sh" auto   # show live miner at login' >> "$HOME/.bashrc"
+  # Without root, cron cannot run. Fallback: every login revives the watchdog loop and shows the live miner.
+  grep -q 'miner/loop.sh' "$HOME/.bashrc" 2>/dev/null || echo '[ -n "$PS1" ] && { bash "$HOME/miner/loop.sh"; [ -z "$TMUX" ] && bash "$HOME/miner/watch.sh" auto; }   # miner autostart' >> "$HOME/.bashrc"
   cat > "$DIR/watchdog.sh" <<'WD'
 #!/usr/bin/env bash
 D="$HOME/miner"
@@ -83,15 +90,18 @@ echo "$(date) miner unhealthy, re-running setup" >> "$D/watchdog.log"
 BTC_ADDRESS="$(cat "$D/.address")" bash "$D/vast-setup.sh" >> "$D/watchdog.log" 2>&1
 WD
   chmod +x "$DIR/watchdog.sh"
-  pgrep -f miner-watch-loop >/dev/null || nohup bash -c 'while true; do sleep 300; bash "$HOME/miner/watchdog.sh"; done' miner-watch-loop >/dev/null 2>&1 &
+  bash "$DIR/loop.sh"
+  AUTOSTART="watchdog loop + login revive (cron not available)"
   local sudo=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo="sudo -n"
   command -v crontab >/dev/null || $sudo apt-get install -y -qq cron >/dev/null 2>&1
   if command -v crontab >/dev/null; then
     ( crontab -l 2>/dev/null | grep -v 'miner/watchdog.sh'
-      echo "@reboot sleep 30; bash $DIR/watchdog.sh; nohup bash -c 'while true; do sleep 300; bash \"\$HOME/miner/watchdog.sh\"; done' miner-watch-loop >/dev/null 2>&1 &"
-      echo "*/5 * * * * bash $DIR/watchdog.sh" ) | crontab - 2>/dev/null && AUTOSTART="cron @reboot + 5-min watchdog" || AUTOSTART="watchdog loop only (cron failed)"
+      echo "@reboot sleep 30; bash $DIR/loop.sh"
+      echo "*/5 * * * * bash $DIR/watchdog.sh" ) | crontab - 2>/dev/null
     $sudo service cron start >/dev/null 2>&1
-  else AUTOSTART="watchdog loop only (no cron on this machine)"; fi
+    # Only claim cron if its daemon is really running (it cannot start without root).
+    pgrep -x cron >/dev/null && AUTOSTART="cron @reboot + 5-min watchdog"
+  fi
 }
 
 main() {
