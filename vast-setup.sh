@@ -62,17 +62,42 @@ W
 #!/usr/bin/env bash
 # Stops the miner AND its watchdog, so nothing restarts it.
 crontab -l 2>/dev/null | grep -v 'miner/watchdog.sh' | crontab - 2>/dev/null
-pkill -f miner-watch-loop; pkill -f run-miner.sh; tmux kill-session -t miner 2>/dev/null
+pkill -f miner-watch-loop; pkill -f fleet-report-loop; pkill -f run-miner.sh; tmux kill-session -t miner 2>/dev/null
 pkill -f SRBMiner-MULTI; pkill -f bzminer
 echo "Miner and watchdog stopped."
 S
   cat > "$DIR/loop.sh" <<'L'
 #!/usr/bin/env bash
-# Starts the 5-minute watchdog loop if it is not already running.
+# Starts the dashboard reporter and the 5-minute watchdog loop if they are not already running.
+[ -f "$HOME/miner/fleet.conf" ] && ! pgrep -f fleet-report-loop >/dev/null && nohup bash "$HOME/miner/reporter.sh" fleet-report-loop >/dev/null 2>&1 &
 pgrep -f miner-watch-loop >/dev/null && exit 0
 nohup bash -c 'while true; do sleep 300; bash "$HOME/miner/watchdog.sh"; done' miner-watch-loop >/dev/null 2>&1 &
 L
-  chmod +x "$DIR/watch.sh" "$DIR/stop.sh" "$DIR/loop.sh"
+  cat > "$DIR/reporter.sh" <<'RP'
+#!/usr/bin/env bash
+# Sends a heartbeat (hashrate, GPU temp/power/util, shares) to the dashboard backend every 30s.
+D="$HOME/miner"; . "$D/fleet.conf" 2>/dev/null || exit 0
+NAME=$(cat "$D/.name"); HOST=$(hostname)
+while true; do
+  LOG=$(sed 's/\x1b\[[0-9;]*m//g' "$D/miner.log" 2>/dev/null | tail -n 400)
+  L=$(echo "$LOG" | grep -E '^\[.*\] +Hashrate +[0-9.]+ [TGM]H/s' | tail -1)
+  [ -n "$L" ] || L=$(echo "$LOG" | grep -E '[0-9.]+ ?[TGM]H/s' | tail -1)   # BzMiner format
+  THS=0; ACC=null; REJ=null
+  if [ -n "$L" ]; then
+    THS=$(echo "$L" | awk '{for(i=2;i<=NF;i++) if($i ~ /^[TGM]H\/s$/ || $i ~ /^[0-9.]+[TGM]H\/s$/){v=$(i-1);u=$i; if($i ~ /^[0-9.]+[TGM]H/){v=$i; sub(/[TGM]H.*/,"",v); u=substr($i,length(v)+1)}; print (substr(u,1,1)=="T")?v:(substr(u,1,1)=="G")?v/1000:v/1e6; exit}}')
+    ACC=$(echo "$L" | awk '{print $(NF-2)}'); REJ=$(echo "$L" | awk '{print $(NF-1)}')
+    case "$ACC$REJ" in *[!0-9]*|"") ACC=null; REJ=null;; esac
+  fi
+  [ -n "$THS" ] || THS=0
+  { pgrep -f "SRBMiner-MULTI|bzminer" >/dev/null && [ -n "$(find "$D/miner.log" -mmin -3 2>/dev/null)" ]; } || THS=0
+  MINER=BzMiner; pgrep -f SRBMiner-MULTI >/dev/null && MINER=SRBMiner
+  GP=$(nvidia-smi --query-gpu=name,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{for(i=2;i<=4;i++) if($i !~ /^[0-9.]+$/) $i=0; printf "%s{\"name\":\"%s\",\"temp\":%s,\"power\":%s,\"util\":%s}", (NR>1?",":""), $1,$2,$3,$4}')
+  curl -fsS -m 15 -X POST "$FLEET_URL/api/ingest" -H "x-token: $FLEET_TOKEN" -H 'content-type: application/json' \
+    -d "{\"name\":\"$NAME\",\"host\":\"$HOST\",\"os\":\"linux\",\"miner\":\"$MINER\",\"ths\":$THS,\"accepted\":$ACC,\"rejected\":$REJ,\"uptime\":$(cut -d. -f1 /proc/uptime),\"cost_hr\":${COST_HR:-null},\"gpus\":[$GP]}" >/dev/null 2>&1
+  sleep 30
+done
+RP
+  chmod +x "$DIR/watch.sh" "$DIR/stop.sh" "$DIR/loop.sh" "$DIR/reporter.sh"
 }
 
 install_autostart() {
@@ -82,6 +107,7 @@ install_autostart() {
   cat > "$DIR/watchdog.sh" <<'WD'
 #!/usr/bin/env bash
 D="$HOME/miner"
+bash "$D/loop.sh"   # keeps the dashboard reporter alive even while the miner is down
 healthy() { pgrep -f run-miner.sh >/dev/null && pgrep -f "SRBMiner-MULTI|bzminer" >/dev/null && [ -n "$(find "$D/miner.log" -mmin -5 2>/dev/null)" ]; }
 healthy && exit 0
 sleep 20; healthy && exit 0
@@ -107,12 +133,18 @@ WD
 main() {
   BTC_ADDRESS="${BTC_ADDRESS:-${1:-}}"
   case "$BTC_ADDRESS" in bc1*) ;; *) fail "give your address:  BTC_ADDRESS=bc1... bash vast-setup.sh" ;; esac
-  local wallet="BTC:${BTC_ADDRESS}" worker="v$(hostname | tr -cd 'a-zA-Z0-9' | tail -c 8)"
+  mkdir -p "$DIR"
+  # Unique, persistent worker name (two rentals named "ubuntu" used to collide on the pool).
+  [ -s "$DIR/.name" ] || printf '%s' "${FLEET_NAME:-v$(hostname | tr -cd 'a-zA-Z0-9' | tail -c 4)$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')}" > "$DIR/.name"
+  local worker; worker=$(cat "$DIR/.name"); local wallet="BTC:${BTC_ADDRESS}"
 
   command -v nvidia-smi >/dev/null || fail "no NVIDIA driver/GPU visible on this machine."
   say "GPU: $(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -2 | tr '\n' ';')"
   mkdir -p "$DIR"; need_tool curl; need_tool tar
   command -v tmux >/dev/null || { s=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && s="sudo -n"; $s apt-get install -y -qq tmux >/dev/null 2>&1; }
+  if [ -n "${FLEET_URL:-}" ] && [ -n "${FLEET_TOKEN:-}" ]; then   # dashboard link; kept for watchdog re-runs
+    printf 'FLEET_URL=%q\nFLEET_TOKEN=%q\nCOST_HR=%q\n' "${FLEET_URL%/}" "$FLEET_TOKEN" "${COST_HR:-}" > "$DIR/fleet.conf"; chmod 600 "$DIR/fleet.conf"
+  fi
   printf '%s' "$BTC_ADDRESS" > "$DIR/.address"; chmod 600 "$DIR/.address"   # so the watchdog can re-run setup
   curl -fsSL -o "$DIR/vast-setup.sh.new" "$SELF_URL" && mv "$DIR/vast-setup.sh.new" "$DIR/vast-setup.sh"
   curl -fsS -m 10 -o /dev/null "https://$POOL_HOST" 2>/dev/null || getent hosts "$POOL_HOST" >/dev/null || fail "cannot reach $POOL_HOST (blocked network or DNS)."
@@ -148,6 +180,7 @@ main() {
   say ""; say "WORKING: $used is mining Pearl as worker $worker -> BTC to your address."
   say "Auto-restart: $AUTOSTART"
   say "Watch it live any time:  bash ~/miner/watch.sh     (leave the view with Ctrl+B then D; the miner keeps running)"
+  [ -f "$DIR/fleet.conf" ] && say "Dashboard: reporting as $worker every 30s."
   say "Stop everything:  bash ~/miner/stop.sh"
   say "Check later:  tail -n 20 ~/miner/miner.log   (accepted shares take hours at this difficulty)"
 }
