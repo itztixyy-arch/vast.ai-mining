@@ -19,7 +19,7 @@ fail() { say ""; say "NOT WORKING: $*"; exit 1; }
 
 need_tool() {  # install a missing tool, with sudo if we are not root
   command -v "$1" >/dev/null && return 0
-  local sudo=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo="sudo"
+  local sudo=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo="sudo -n"
   $sudo apt-get update -qq >/dev/null 2>&1; $sudo apt-get install -y -qq "$1" >/dev/null 2>&1
   command -v "$1" >/dev/null || fail "need '$1' and could not install it (no root/sudo)."
 }
@@ -84,7 +84,7 @@ BTC_ADDRESS="$(cat "$D/.address")" bash "$D/vast-setup.sh" >> "$D/watchdog.log" 
 WD
   chmod +x "$DIR/watchdog.sh"
   pgrep -f miner-watch-loop >/dev/null || nohup bash -c 'while true; do sleep 300; bash "$HOME/miner/watchdog.sh"; done' miner-watch-loop >/dev/null 2>&1 &
-  local sudo=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo="sudo"
+  local sudo=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo="sudo -n"
   command -v crontab >/dev/null || $sudo apt-get install -y -qq cron >/dev/null 2>&1
   if command -v crontab >/dev/null; then
     ( crontab -l 2>/dev/null | grep -v 'miner/watchdog.sh'
@@ -102,7 +102,7 @@ main() {
   command -v nvidia-smi >/dev/null || fail "no NVIDIA driver/GPU visible on this machine."
   say "GPU: $(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -2 | tr '\n' ';')"
   mkdir -p "$DIR"; need_tool curl; need_tool tar
-  command -v tmux >/dev/null || { s=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && s="sudo"; $s apt-get install -y -qq tmux >/dev/null 2>&1; }
+  command -v tmux >/dev/null || { s=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && s="sudo -n"; $s apt-get install -y -qq tmux >/dev/null 2>&1; }
   printf '%s' "$BTC_ADDRESS" > "$DIR/.address"; chmod 600 "$DIR/.address"   # so the watchdog can re-run setup
   curl -fsSL -o "$DIR/vast-setup.sh.new" "$SELF_URL" && mv "$DIR/vast-setup.sh.new" "$DIR/vast-setup.sh"
   curl -fsS -m 10 -o /dev/null "https://$POOL_HOST" 2>/dev/null || getent hosts "$POOL_HOST" >/dev/null || fail "cannot reach $POOL_HOST (blocked network or DNS)."
